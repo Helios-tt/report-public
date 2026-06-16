@@ -1,0 +1,236 @@
+
+pragma solidity ^0.8.20;
+
+import {Test, console2} from "forge-std/Test.sol";
+
+abstract contract Base is Test {
+    address constant NATIVE_ASSET = address(0);
+
+    struct ProfitLeg {
+        address holder;
+        address alternateHolder;
+        address asset;
+        string symbol;
+        uint256 expectedDeltaRaw;
+        bool strict;
+        uint8 repairPolicy;
+        bool balancerInternalBalance;
+    }
+
+    struct EconomicOracle {
+        address holder;
+        address asset;
+        string symbol;
+        string oracleKind;
+        bool expectPositive;
+        uint256 expectedDeltaRaw;
+        bool balancerInternalBalance;
+    }
+
+    event ProfitObservation(string symbol, uint256 expectedDeltaRaw, int256 replayDelta);
+    event EconomicOracle(string oracleKind, string symbol, uint256 expectedDeltaRaw, int256 replayDelta);
+
+    uint8 constant PROFIT_REPAIR_OBSERVE_ONLY = 0;
+
+    ProfitLeg[] internal profitLegs;
+    EconomicOracle[] internal economicOracles;
+    uint256[] internal beforeBalances;
+    uint256[] internal beforeAlternateBalances;
+    uint256[] internal beforeEconomicBalances;
+
+    function _expectProfit(
+        address holder,
+        address alternateHolder,
+        address asset,
+        string memory symbol,
+        uint256 amount
+    ) internal {
+        profitLegs.push(
+            ProfitLeg(holder, alternateHolder, asset, symbol, amount, true, PROFIT_REPAIR_OBSERVE_ONLY, false)
+        );
+    }
+
+    function _logBalances(string memory label) internal view {
+        console2.log(label);
+        for (uint256 i = 0; i < profitLegs.length; i++) {
+            console2.log(profitLegs[i].symbol, profitLegs[i].holder);
+            console2.log("balance", _legBalance(profitLegs[i]));
+            if (profitLegs[i].alternateHolder != address(0)) {
+                console2.log(profitLegs[i].symbol, profitLegs[i].alternateHolder);
+                console2.log("balance", _alternateLegBalance(profitLegs[i]));
+            }
+        }
+    }
+
+    function _snapProfit() internal {
+        delete beforeBalances;
+        delete beforeAlternateBalances;
+        for (uint256 i = 0; i < profitLegs.length; i++) {
+            beforeBalances.push(_legBalance(profitLegs[i]));
+            beforeAlternateBalances.push(_alternateLegBalance(profitLegs[i]));
+        }
+    }
+
+    function _snapEconomics() internal {
+        delete beforeEconomicBalances;
+        for (uint256 i = 0; i < economicOracles.length; i++) {
+            beforeEconomicBalances.push(_oracleBalance(economicOracles[i]));
+        }
+    }
+
+    function _assertProfit() internal {
+        if (profitLegs.length == 0) {
+            if (economicOracles.length == 0) {
+                console2.log("PoCWarning", "no profit/economic oracle generated", "replay reachability only");
+            } else {
+                console2.log("Info", "no direct profit oracle generated", "economic oracle will be asserted");
+            }
+            return;
+        }
+        _assertProfitLegs();
+    }
+
+    function _assertProfitLegs() internal {
+        require(profitLegs.length > 0, "no profit oracle generated");
+        bool anyPositive;
+        bool anyCloseToReplay;
+        bool hasStrictProfitLeg;
+        uint256 aggregateExpected;
+        uint256 aggregateReplay;
+        for (uint256 i = 0; i < profitLegs.length; i++) {
+            uint256 afterBalance = _legBalance(profitLegs[i]);
+            uint256 afterAlternateBalance = _alternateLegBalance(profitLegs[i]);
+            int256 primaryDelta = _signed(afterBalance) - _signed(beforeBalances[i]);
+            int256 alternateDelta = _signed(afterAlternateBalance) - _signed(beforeAlternateBalances[i]);
+            int256 delta = primaryDelta >= alternateDelta ? primaryDelta : alternateDelta;
+            emit ProfitObservation(profitLegs[i].symbol, profitLegs[i].expectedDeltaRaw, delta);
+            console2.log("ProfitObservation", profitLegs[i].symbol, profitLegs[i].expectedDeltaRaw);
+            console2.logInt(delta);
+            if (profitLegs[i].strict) hasStrictProfitLeg = true;
+            aggregateExpected += profitLegs[i].expectedDeltaRaw;
+            if (delta > 0) {
+                anyPositive = true;
+                uint256 replay = uint256(delta);
+                aggregateReplay += replay;
+                if (profitLegs[i].expectedDeltaRaw < 1_000_000) {
+                    uint256 dustDiff = replay > profitLegs[i].expectedDeltaRaw
+                        ? replay - profitLegs[i].expectedDeltaRaw
+                        : profitLegs[i].expectedDeltaRaw - replay;
+                    if (dustDiff <= 1_000_000) anyCloseToReplay = true;
+                } else if (
+                    replay * 100 >= profitLegs[i].expectedDeltaRaw * 50
+                        && replay * 100 <= profitLegs[i].expectedDeltaRaw * 200
+                ) {
+                    anyCloseToReplay = true;
+                }
+            }
+        }
+        if (!anyCloseToReplay && aggregateExpected > 0 && aggregateReplay > 0) {
+            anyCloseToReplay = aggregateReplay * 100 >= aggregateExpected * 50
+                && aggregateReplay * 100 <= aggregateExpected * 200;
+        }
+        if (!hasStrictProfitLeg) return;
+        require(anyPositive, "no positive replay profit leg");
+        require(anyCloseToReplay, "replay profit delta outside expected band");
+    }
+
+    function _assertEconomics() internal {
+        if (economicOracles.length == 0) return;
+        require(beforeEconomicBalances.length == economicOracles.length, "economic oracle snapshot missing");
+        bool anyEconomicReplay;
+        bool hasDirectProfitEconomic;
+        bool anyDirectProfitEconomicClose;
+        bool skippedDuplicateDirectProfitEconomic;
+        bool hasAdvisoryFlowEconomic;
+        for (uint256 i = 0; i < economicOracles.length; i++) {
+            uint256 afterBalance = _oracleBalance(economicOracles[i]);
+            int256 delta = _signed(afterBalance) - _signed(beforeEconomicBalances[i]);
+            emit EconomicOracle(
+                economicOracles[i].oracleKind,
+                economicOracles[i].symbol,
+                economicOracles[i].expectedDeltaRaw,
+                delta
+            );
+            console2.log("EconomicOracle", economicOracles[i].oracleKind);
+            console2.log("EconomicOracleSymbol", economicOracles[i].symbol);
+            console2.log("EconomicOracleExpected", economicOracles[i].expectedDeltaRaw);
+            console2.logInt(delta);
+            uint256 replay = 0;
+            if (economicOracles[i].expectPositive && delta > 0) replay = uint256(delta);
+            if (!economicOracles[i].expectPositive && delta < 0) replay = uint256(-delta);
+            bool closeToExpected = replay > 0;
+            if (economicOracles[i].expectedDeltaRaw >= 1_000_000) {
+                closeToExpected = replay * 100 >= economicOracles[i].expectedDeltaRaw * 50
+                    && replay * 100 <= economicOracles[i].expectedDeltaRaw * 200;
+            }
+            bool isBalanceProfit =
+                keccak256(bytes(economicOracles[i].oracleKind)) == keccak256(bytes("balance_profit"));
+            if (isBalanceProfit && profitLegs.length > 0) {
+                skippedDuplicateDirectProfitEconomic = true;
+                continue;
+            }
+            if (isBalanceProfit) {
+                hasDirectProfitEconomic = true;
+                if (closeToExpected) anyDirectProfitEconomicClose = true;
+                continue;
+            }
+            hasAdvisoryFlowEconomic = true;
+            if (closeToExpected) anyEconomicReplay = true;
+        }
+        if (hasDirectProfitEconomic) {
+            require(anyDirectProfitEconomicClose, "no balance_profit economic oracle reproduced");
+            anyEconomicReplay = true;
+        }
+        if (skippedDuplicateDirectProfitEconomic) anyEconomicReplay = true;
+        if (hasAdvisoryFlowEconomic && !hasDirectProfitEconomic) {
+            if (!anyEconomicReplay) {
+                console2.log("PoCWarning", "advisory economic oracle not reproduced", "reachability-only replay");
+            }
+            return;
+        }
+        require(anyEconomicReplay, "no economic oracle matched expected direction and band");
+    }
+
+    function _legBalance(ProfitLeg memory leg) internal view returns (uint256) {
+        if (leg.balancerInternalBalance) return _balancerInternalBalance(leg.holder, leg.asset);
+        if (leg.asset == NATIVE_ASSET) return leg.holder.balance;
+        return _safeTokenBalance(leg.asset, leg.holder);
+    }
+
+    function _oracleBalance(EconomicOracle memory oracle) internal view returns (uint256) {
+        if (oracle.balancerInternalBalance) return _balancerInternalBalance(oracle.holder, oracle.asset);
+        if (oracle.asset == NATIVE_ASSET) return oracle.holder.balance;
+        return _safeTokenBalance(oracle.asset, oracle.holder);
+    }
+
+    function _alternateLegBalance(ProfitLeg memory leg) internal view returns (uint256) {
+        if (leg.alternateHolder == address(0)) return 0;
+        if (leg.balancerInternalBalance) return _balancerInternalBalance(leg.alternateHolder, leg.asset);
+        if (leg.asset == NATIVE_ASSET) return leg.alternateHolder.balance;
+        return _safeTokenBalance(leg.asset, leg.alternateHolder);
+    }
+
+    function _balancerInternalBalance(address account, address token) internal view returns (uint256) {
+        address[] memory tokens = new address[](1);
+        tokens[0] = token;
+        (bool ok, bytes memory data) = address(0xBA12222222228d8Ba445958a75a0704d566BF2C8).staticcall(
+            abi.encodeWithSignature("getInternalBalance(address,address[])", account, tokens)
+        );
+        if (!ok || data.length < 32) return 0;
+        uint256[] memory balances = abi.decode(data, (uint256[]));
+        if (balances.length == 0) return 0;
+        return balances[0];
+    }
+
+    function _safeTokenBalance(address token, address account) internal view returns (uint256) {
+        if (token.code.length == 0) return 0;
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSignature("balanceOf(address)", account));
+        if (!ok || data.length < 32) return 0;
+        return abi.decode(data, (uint256));
+    }
+
+    function _signed(uint256 value) internal pure returns (int256) {
+        require(value <= uint256(type(int256).max), "balance too large");
+        return int256(value);
+    }
+}
