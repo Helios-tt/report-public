@@ -1,5 +1,11 @@
 # Public RCA Reports
 
+<p align="center">
+  <a href="https://x.com/backwardlabs">
+    <img src="https://img.shields.io/badge/Follow%20on%20X-%40backwardlabs-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow @backwardlabs on X">
+  </a>
+</p>
+
 This repository contains public exploit-analysis reports and Solidity PoC bundles generated through the RCA stage.
 
 - Source commit: `555581b0312b492da5ea4a161b2ae63b78c96c9b`
